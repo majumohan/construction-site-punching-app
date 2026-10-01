@@ -1,0 +1,1420 @@
+<?php
+require_once dirname(__DIR__) . '/backend/config/database.php';
+require_login('login.php');
+$currentUser = current_user();
+
+$alertSuccess = '';
+$alertError = '';
+
+// Handle POST actions (delete single record, clean duplicates)
+if ($_SERVER['REQUEST_METHOD'] === 'POST') {
+    $action = $_POST['action'] ?? '';
+    if ($action === 'delete_attendance') {
+        $id = (int)($_POST['id'] ?? 0);
+        if ($id > 0) {
+            $del = $pdo->prepare("DELETE FROM `attendance` WHERE `id` = ?");
+            $del->execute([$id]);
+            $alertSuccess = "Attendance record #{$id} has been permanently deleted.";
+        }
+    } elseif ($action === 'update_working_hours') {
+        $hours = (int)($_POST['working_hours'] ?? 8);
+        $pdo->prepare("INSERT INTO `system_meta` (`meta_key`, `meta_value`) VALUES ('working_hours', ?) ON DUPLICATE KEY UPDATE `meta_value` = ?")->execute([$hours, $hours]);
+        $alertSuccess = "Standard working hours updated to {$hours}h.";
+    } elseif ($action === 'clean_duplicates') {
+        // Query duplicate records within 120 seconds
+        $dupQuery = "
+            SELECT a2.id AS duplicate_id
+            FROM `attendance` a1
+            JOIN `attendance` a2 
+              ON (a1.supervisor_name = a2.supervisor_name OR a1.employee_id = a2.employee_id)
+              AND a1.site_name = a2.site_name
+              AND a1.id < a2.id
+              AND ABS(TIMESTAMPDIFF(SECOND, a1.punch_in_time, a2.punch_in_time)) <= 120
+        ";
+        $stmt = $pdo->query($dupQuery);
+        $dupIds = $stmt->fetchAll(PDO::FETCH_COLUMN);
+
+        $deletedCount = 0;
+        if (!empty($dupIds)) {
+            $inQuery = implode(',', array_map('intval', $dupIds));
+            $deletedCount = $pdo->exec("DELETE FROM `attendance` WHERE `id` IN ($inQuery)");
+        }
+
+        // Auto-close orphaned unclosed active shifts if the user has newer shifts that are already closed
+        $closeOrphaned = $pdo->exec("
+            UPDATE `attendance` a
+            JOIN `attendance` newer 
+              ON (a.supervisor_name = newer.supervisor_name OR a.employee_id = newer.employee_id)
+              AND newer.punch_in_time > a.punch_in_time
+            SET a.punch_out_time = newer.punch_in_time,
+                a.notes = CASE 
+                    WHEN a.notes IS NOT NULL AND a.notes != '' THEN CONCAT(a.notes, '\n[Auto-Closed]: Synchronized before subsequent punch')
+                    ELSE '[Auto-Closed]: Synchronized before subsequent punch'
+                END
+            WHERE a.punch_out_time IS NULL
+        ");
+
+        $alertSuccess = "Cleaned {$deletedCount} duplicate punch records and synchronized {$closeOrphaned} orphaned active shifts.";
+    }
+}
+
+// Fetch standard working hours setting
+$whStmt = $pdo->query("SELECT `meta_value` FROM `system_meta` WHERE `meta_key` = 'working_hours'");
+$wh = $whStmt->fetchColumn();
+$standardWorkingHours = $wh ? (int)$wh : 8;
+$standardWorkingSeconds = $standardWorkingHours * 3600;
+
+// Fetch all attendance records from MySQL
+$stmt = $pdo->query("SELECT * FROM `attendance` ORDER BY `punch_in_time` DESC");
+$logs = $stmt->fetchAll();
+
+// Detect duplicates
+$dupCountQuery = "
+    SELECT COUNT(*) 
+    FROM `attendance` a1
+    JOIN `attendance` a2 
+      ON (a1.supervisor_name = a2.supervisor_name OR a1.employee_id = a2.employee_id)
+      AND a1.site_name = a2.site_name
+      AND a1.id < a2.id
+      AND ABS(TIMESTAMPDIFF(SECOND, a1.punch_in_time, a2.punch_in_time)) <= 120
+";
+$dupCount = (int)$pdo->query($dupCountQuery)->fetchColumn();
+
+// Fetch all users for user filter
+$userStmt = $pdo->query("SELECT `id`, `full_name`, `username`, `employee_id`, `role`, `department` FROM `users` ORDER BY `full_name` ASC");
+$allUsers = $userStmt->fetchAll();
+
+// Global metrics
+$totalPunches = count($logs);
+$activeShifts = 0;
+$todayPunches = 0;
+$todayDate = date('Y-m-d');
+
+// Build User-Wise & Day-Wise Grouping
+$userWise = [];
+foreach ($logs as $l) {
+    $uName = !empty($l['supervisor_name']) ? trim($l['supervisor_name']) : 'Unknown User';
+    $empId = !empty($l['employee_id']) ? trim($l['employee_id']) : ('SUP-' . $l['id']);
+    $dateKey = substr($l['punch_in_time'], 0, 10);
+
+    if (empty($l['punch_out_time'])) $activeShifts++;
+    if ($dateKey === $todayDate) $todayPunches++;
+
+    if (!isset($userWise[$uName])) {
+        // Initials
+        $parts = explode(' ', $uName);
+        $initials = count($parts) >= 2 
+            ? strtoupper(substr($parts[0], 0, 1) . substr($parts[count($parts) - 1], 0, 1))
+            : strtoupper(substr($uName, 0, 2));
+
+        $userWise[$uName] = [
+            'name'           => $uName,
+            'employee_id'    => $empId,
+            'initials'       => $initials ?: 'SU',
+            'total_shifts'   => 0,
+            'total_seconds'  => 0,
+            'days'           => []
+        ];
+    }
+
+    $pInTime = strtotime($l['punch_in_time']);
+    $pOutTime = !empty($l['punch_out_time']) ? strtotime($l['punch_out_time']) : null;
+    $durationSec = $pOutTime ? max(0, $pOutTime - $pInTime) : max(0, time() - $pInTime);
+
+    $userWise[$uName]['total_shifts']++;
+    $userWise[$uName]['total_seconds'] += $durationSec;
+
+    if (!isset($userWise[$uName]['days'][$dateKey])) {
+        $userWise[$uName]['days'][$dateKey] = [
+            'date'           => $dateKey,
+            'day_name'       => date('l', $pInTime),
+            'formatted_date' => date('M d, Y', $pInTime),
+            'first_in'       => $l['punch_in_time'],
+            'last_out'       => $l['punch_out_time'],
+            'day_seconds'    => 0,
+            'has_active'     => false,
+            'sites'          => [],
+            'punches'        => []
+        ];
+    }
+
+    $userWise[$uName]['days'][$dateKey]['day_seconds'] += $durationSec;
+    if (empty($l['punch_out_time'])) {
+        $userWise[$uName]['days'][$dateKey]['has_active'] = true;
+    }
+    if (!in_array($l['site_name'], $userWise[$uName]['days'][$dateKey]['sites'])) {
+        $userWise[$uName]['days'][$dateKey]['sites'][] = $l['site_name'];
+    }
+
+    $userWise[$uName]['days'][$dateKey]['punches'][] = $l;
+}
+
+// Default filter selection from query params
+$selectedUserFilter = trim($_GET['user'] ?? '');
+$activeTab = $_GET['tab'] ?? 'user_wise';
+?>
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>User Attendance & All-Day Punches • SiteTracker Hub</title>
+  
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
+
+  <style>
+    :root {
+      --primary: #0066FF;
+      --primary-dark: #0052CC;
+      --primary-light: #EBF2FF;
+      --success: #10B981;
+      --success-light: #ECFDF5;
+      --warning: #F59E0B;
+      --warning-light: #FFFBEB;
+      --danger: #EF4444;
+      --danger-light: #FEF2F2;
+      --slate-900: #0F172A;
+      --slate-800: #1E293B;
+      --slate-700: #334155;
+      --slate-600: #475569;
+      --slate-500: #64748B;
+      --slate-400: #94A3B8;
+      --slate-200: #E2E8F0;
+      --slate-100: #F1F5F9;
+      --slate-50: #F8FAFC;
+      --radius-sm: 8px;
+      --radius-md: 12px;
+      --radius-lg: 16px;
+      --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.05);
+      --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.07);
+      --shadow-lg: 0 10px 15px -3px rgba(0, 0, 0, 0.1);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; font-family: 'Plus Jakarta Sans', sans-serif; }
+    body { background-color: #F8FAFC; color: var(--slate-900); display: flex; min-height: 100vh; }
+
+    /* Sidebar */
+    .sidebar {
+      width: 260px;
+      background: #0F172A;
+      color: white;
+      display: flex;
+      flex-direction: column;
+      flex-shrink: 0;
+      position: sticky;
+      top: 0;
+      height: 100vh;
+      border-right: 1px solid rgba(255, 255, 255, 0.08);
+      z-index: 100;
+    }
+    .brand {
+      padding: 24px 20px;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    }
+    .brand-icon {
+      width: 40px;
+      height: 40px;
+      background: var(--primary);
+      border-radius: var(--radius-sm);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+      color: white;
+      box-shadow: 0 4px 12px rgba(0, 102, 255, 0.4);
+    }
+    .brand-text h2 { font-size: 18px; font-weight: 800; letter-spacing: -0.5px; }
+    .brand-text span { font-size: 11px; color: var(--slate-400); text-transform: uppercase; letter-spacing: 1px; }
+
+    .nav-menu { list-style: none; padding: 20px 12px; display: flex; flex-direction: column; gap: 6px; flex: 1; }
+    .nav-item a {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 14px;
+      color: var(--slate-400);
+      text-decoration: none;
+      border-radius: var(--radius-sm);
+      font-size: 14px;
+      font-weight: 500;
+      transition: all 0.2s ease;
+    }
+    .nav-item a:hover { color: white; background: rgba(255, 255, 255, 0.05); }
+    .nav-item.active a { color: white; background: var(--primary); font-weight: 600; box-shadow: 0 4px 12px rgba(0, 102, 255, 0.3); }
+
+    .sidebar-footer {
+      padding: 20px 16px;
+      border-top: 1px solid rgba(255, 255, 255, 0.08);
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .admin-avatar {
+      width: 38px;
+      height: 38px;
+      background: rgba(255, 255, 255, 0.1);
+      border: 1px solid rgba(255, 255, 255, 0.2);
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-weight: 700;
+      font-size: 13px;
+      color: white;
+    }
+    .admin-info { flex: 1; overflow: hidden; }
+    .admin-info .name { font-size: 13px; font-weight: 600; white-space: nowrap; text-overflow: ellipsis; overflow: hidden; }
+    .admin-info .role { font-size: 11px; color: var(--slate-400); }
+    .logout-btn { color: var(--slate-400); text-decoration: none; font-size: 16px; padding: 6px; transition: color 0.2s; }
+    .logout-btn:hover { color: var(--danger); }
+
+    /* Main Area */
+    .main { flex: 1; display: flex; flex-direction: column; overflow-y: auto; }
+    .topbar {
+      background: white;
+      height: 72px;
+      padding: 0 32px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      border-bottom: 1px solid var(--slate-200);
+      position: sticky;
+      top: 0;
+      z-index: 90;
+    }
+    .page-title { font-size: 20px; font-weight: 800; color: var(--slate-900); }
+    .topbar-actions { display: flex; align-items: center; gap: 12px; }
+
+    .btn {
+      padding: 10px 16px;
+      border-radius: var(--radius-sm);
+      font-size: 13.5px;
+      font-weight: 600;
+      cursor: pointer;
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border: none;
+      text-decoration: none;
+      transition: all 0.2s ease;
+    }
+    .btn-primary { background: var(--primary); color: white; }
+    .btn-primary:hover { background: var(--primary-dark); }
+    .btn-outline { background: white; border: 1px solid var(--slate-200); color: var(--slate-700); }
+    .btn-outline:hover { background: var(--slate-50); border-color: var(--slate-300); }
+
+    .content { padding: 32px; display: flex; flex-direction: column; gap: 24px; }
+
+    /* Metrics Grid */
+    .metrics-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 16px;
+    }
+    .metric-card {
+      background: white;
+      border: 1px solid var(--slate-200);
+      border-radius: var(--radius-md);
+      padding: 18px 20px;
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      box-shadow: var(--shadow-sm);
+    }
+    .metric-icon {
+      width: 46px;
+      height: 46px;
+      border-radius: var(--radius-md);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 20px;
+    }
+    .metric-icon.blue { background: var(--primary-light); color: var(--primary); }
+    .metric-icon.green { background: var(--success-light); color: var(--success); }
+    .metric-icon.amber { background: var(--warning-light); color: var(--warning); }
+    .metric-icon.purple { background: #F3E8FF; color: #9333EA; }
+    .metric-info h4 { font-size: 11.5px; color: var(--slate-500); text-transform: uppercase; font-weight: 700; letter-spacing: 0.5px; }
+    .metric-info .val { font-size: 22px; font-weight: 800; color: var(--slate-900); margin-top: 2px; }
+
+    /* Tabs & Filter Bar */
+    .view-control-bar {
+      background: white;
+      border: 1px solid var(--slate-200);
+      border-radius: var(--radius-md);
+      padding: 14px 20px;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 16px;
+      flex-wrap: wrap;
+      box-shadow: var(--shadow-sm);
+    }
+
+    .tab-pills {
+      display: flex;
+      background: var(--slate-100);
+      padding: 4px;
+      border-radius: var(--radius-sm);
+      gap: 4px;
+    }
+    .tab-btn {
+      padding: 8px 16px;
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--slate-600);
+      border: none;
+      background: transparent;
+      border-radius: 6px;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      transition: all 0.2s ease;
+    }
+    .tab-btn.active {
+      background: white;
+      color: var(--primary);
+      box-shadow: 0 2px 4px rgba(0,0,0,0.06);
+    }
+
+    .filters-group {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+    .filter-select {
+      padding: 8px 14px;
+      border: 1px solid var(--slate-200);
+      border-radius: var(--radius-sm);
+      font-size: 13px;
+      font-weight: 500;
+      background: white;
+      color: var(--slate-700);
+      outline: none;
+    }
+    .filter-select:focus { border-color: var(--primary); }
+
+    /* User-Wise Section */
+    .user-section-card {
+      background: white;
+      border: 1px solid var(--slate-200);
+      border-radius: var(--radius-md);
+      overflow: hidden;
+      margin-bottom: 24px;
+      box-shadow: var(--shadow-sm);
+    }
+    .user-header {
+      padding: 20px 24px;
+      background: #FAFAFC;
+      border-bottom: 1px solid var(--slate-200);
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .user-identity {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+    }
+    .user-badge-avatar {
+      width: 44px;
+      height: 44px;
+      background: linear-gradient(135deg, #0066FF, #0052CC);
+      color: white;
+      font-weight: 800;
+      font-size: 15px;
+      border-radius: 12px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      box-shadow: 0 4px 10px rgba(0, 102, 255, 0.25);
+    }
+    .user-meta h3 { font-size: 17px; font-weight: 800; color: var(--slate-900); }
+    .user-meta .sub { font-size: 12.5px; color: var(--slate-500); display: flex; align-items: center; gap: 8px; margin-top: 2px; }
+
+    .user-stats-pill {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      background: white;
+      border: 1px solid var(--slate-200);
+      padding: 8px 16px;
+      border-radius: 20px;
+    }
+    .stat-mini { font-size: 12px; color: var(--slate-500); }
+    .stat-mini strong { font-size: 14px; color: var(--slate-900); font-weight: 700; margin-left: 4px; }
+
+    /* Day Accordion / Card */
+    .day-card {
+      border-bottom: 1px solid var(--slate-200);
+    }
+    .day-card:last-child { border-bottom: none; }
+    .day-header {
+      padding: 16px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      background: white;
+      cursor: pointer;
+      user-select: none;
+      transition: background 0.15s ease;
+      gap: 16px;
+      flex-wrap: wrap;
+    }
+    .day-header:hover { background: #F8FAFC; }
+    .day-title-wrap {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .day-calendar-box {
+      width: 44px;
+      height: 44px;
+      background: var(--slate-100);
+      border-radius: 10px;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      font-weight: 800;
+      color: var(--slate-800);
+      line-height: 1;
+    }
+    .day-calendar-box .cal-month { font-size: 10px; text-transform: uppercase; color: var(--slate-500); }
+    .day-calendar-box .cal-num { font-size: 17px; margin-top: 2px; }
+
+    .day-info h4 { font-size: 14.5px; font-weight: 700; color: var(--slate-900); }
+    .day-info span { font-size: 12px; color: var(--slate-500); }
+
+    .day-summary-badges {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      flex-wrap: wrap;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 10px;
+      border-radius: 9999px;
+      font-size: 11.5px;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+    .badge-success { background: var(--success-light); color: var(--success); }
+    .badge-danger { background: var(--danger-light); color: var(--danger); }
+    .badge-primary { background: var(--primary-light); color: var(--primary); }
+    .badge-warning { background: var(--warning-light); color: var(--warning); }
+    .badge-neutral { background: var(--slate-100); color: var(--slate-700); }
+
+    .toggle-icon {
+      font-size: 14px;
+      color: var(--slate-400);
+      transition: transform 0.2s ease;
+    }
+    .day-card.open .toggle-icon { transform: rotate(180deg); }
+
+    .day-content {
+      padding: 0 24px 20px 24px;
+      background: #FDFEFE;
+      display: none;
+    }
+    .day-card.open .day-content { display: block; }
+
+    /* Punch Table inside Day */
+    .punches-table {
+      width: 100%;
+      border: 1px solid var(--slate-200);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+      margin-top: 12px;
+      border-collapse: collapse;
+      font-size: 13px;
+      background: white;
+    }
+    .punches-table th {
+      background: #F8FAFC;
+      padding: 10px 14px;
+      font-weight: 700;
+      color: var(--slate-600);
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      border-bottom: 1px solid var(--slate-200);
+    }
+    .punches-table td {
+      padding: 12px 14px;
+      border-bottom: 1px solid var(--slate-100);
+      vertical-align: middle;
+    }
+    .punches-table tr:last-child td { border-bottom: none; }
+
+    .photo-thumb-wrap { display: inline-flex; align-items: center; gap: 8px; }
+    .photo-item { position: relative; display: inline-block; }
+    .photo-thumb {
+      width: 42px;
+      height: 42px;
+      border-radius: 8px;
+      object-fit: cover;
+      cursor: pointer;
+      border: 1.5px solid var(--slate-200);
+      transition: all 0.2s ease;
+      background: var(--slate-100);
+    }
+    .photo-thumb:hover { transform: scale(1.1); box-shadow: 0 4px 10px rgba(0,0,0,0.15); border-color: var(--primary); }
+    .photo-tag {
+      position: absolute;
+      bottom: 2px;
+      right: 2px;
+      background: rgba(15, 23, 42, 0.85);
+      color: white;
+      font-size: 8.5px;
+      font-weight: 700;
+      padding: 1px 3px;
+      border-radius: 3px;
+      pointer-events: none;
+    }
+
+    .coords-link {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      color: var(--primary);
+      text-decoration: none;
+      font-weight: 600;
+      font-family: monospace;
+      font-size: 11.5px;
+    }
+    .coords-link:hover { text-decoration: underline; }
+
+    /* Modal for photo */
+    .modal-overlay {
+      position: fixed; inset: 0; background: rgba(15, 23, 42, 0.8);
+      backdrop-filter: blur(4px); display: none; align-items: center;
+      justify-content: center; z-index: 9999; padding: 20px;
+    }
+    .modal-overlay.open { display: flex; }
+    .photo-modal-card {
+      background: white; border-radius: var(--radius-lg); padding: 20px;
+      max-width: 520px; width: 100%; text-align: center;
+      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.3);
+    }
+    .photo-modal-card img { width: 100%; border-radius: var(--radius-md); max-height: 520px; object-fit: cover; }
+    .photo-modal-title { font-size: 15px; font-weight: 700; color: var(--slate-900); margin-bottom: 12px; text-align: left; }
+  </style>
+</head>
+<body>
+
+  <!-- Sidebar -->
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-icon">
+        <i class="fa-solid fa-map-location-dot"></i>
+      </div>
+      <div class="brand-text">
+        <h2>SiteTracker</h2>
+        <span>Operations Hub</span>
+      </div>
+    </div>
+
+    <ul class="nav-menu">
+      <li class="nav-item">
+        <a href="dashboard.php"><i class="fa-solid fa-gauge-high"></i> Dashboard</a>
+      </li>
+      <li class="nav-item">
+        <a href="sites.php"><i class="fa-solid fa-city"></i> Construction Sites</a>
+      </li>
+      <li class="nav-item active">
+        <a href="attendance.php"><i class="fa-solid fa-clipboard-list"></i> Attendance Records</a>
+      </li>
+      <li class="nav-item">
+        <a href="users.php"><i class="fa-solid fa-users-gear"></i> User Accounts</a>
+      </li>
+    </ul>
+
+    <div class="sidebar-footer">
+      <div class="admin-avatar"><?= htmlspecialchars($currentUser['initials']) ?></div>
+      <div class="admin-info">
+        <div class="name"><?= htmlspecialchars($currentUser['full_name']) ?></div>
+        <div class="role"><?= htmlspecialchars($currentUser['role']) ?></div>
+      </div>
+      <a href="login.php?action=logout" class="logout-btn" title="Sign Out">
+        <i class="fa-solid fa-arrow-right-from-bracket"></i>
+      </a>
+    </div>
+  </aside>
+
+  <!-- Main Workspace -->
+  <main class="main">
+    <header class="topbar">
+      <div>
+        <h1 class="page-title">User Daily Attendance & Punching Log</h1>
+      </div>
+      <div class="topbar-actions">
+        <button class="btn btn-outline" style="color: #D97706; border-color: rgba(245, 158, 11, 0.4);" onclick="triggerCleanDuplicates()" title="Detect and purge rapid duplicate punch-in entries">
+          <i class="fa-solid fa-broom"></i> Clean Duplicates <?= $dupCount > 0 ? "<span class='badge badge-warning' style='margin-left: 5px; font-size: 11px;'>$dupCount</span>" : "" ?>
+        </button>
+        <button class="btn btn-outline" onclick="window.location.reload()">
+          <i class="fa-solid fa-arrows-rotate"></i> Refresh
+        </button>
+        <button class="btn btn-primary" onclick="exportCSV()">
+          <i class="fa-solid fa-file-csv"></i> Export CSV
+        </button>
+        <a href="login.php?action=logout" class="btn btn-outline" style="color: #EF4444; border-color: rgba(239, 68, 68, 0.25);">
+          <i class="fa-solid fa-arrow-right-from-bracket"></i> Logout
+        </a>
+      </div>
+    </header>
+
+    <div class="content">
+      <?php if (!empty($alertSuccess)): ?>
+        <div style="background: rgba(16, 185, 129, 0.12); border: 1px solid rgba(16, 185, 129, 0.35); border-radius: var(--radius-md); padding: 14px 18px; margin-bottom: 20px; display: flex; align-items: center; gap: 12px; color: #065F46; font-size: 14px;">
+          <i class="fa-solid fa-circle-check" style="font-size: 18px; color: #10B981;"></i>
+          <span><?= htmlspecialchars($alertSuccess) ?></span>
+        </div>
+      <?php endif; ?>
+
+      <?php if ($dupCount > 0): ?>
+        <div style="background: rgba(245, 158, 11, 0.12); border: 1px solid rgba(245, 158, 11, 0.35); border-radius: var(--radius-md); padding: 14px 18px; margin-bottom: 20px; display: flex; align-items: center; justify-content: space-between; gap: 14px; flex-wrap: wrap;">
+          <div style="display: flex; align-items: center; gap: 12px; color: #B45309;">
+            <i class="fa-solid fa-triangle-exclamation" style="font-size: 20px; color: #F59E0B;"></i>
+            <div>
+              <strong>Duplicate Attendance Records Detected</strong>
+              <div style="font-size: 13px; color: var(--slate-600); margin-top: 2px;">
+                Found <strong><?= $dupCount ?></strong> duplicate punch entries recorded within 120 seconds for the same site.
+              </div>
+            </div>
+          </div>
+          <button class="btn btn-primary" style="background: #F59E0B; border-color: #D97706; padding: 8px 16px; font-size: 13px;" onclick="triggerCleanDuplicates()">
+            <i class="fa-solid fa-broom"></i> Remove Duplicates Now
+          </button>
+        </div>
+      <?php endif; ?>
+
+      <!-- Top Metrics -->
+      <div class="metrics-grid">
+        <div class="metric-card">
+          <div class="metric-icon blue"><i class="fa-solid fa-clipboard-check"></i></div>
+          <div class="metric-info">
+            <h4>Total Field Punches</h4>
+            <div class="val"><?= $totalPunches ?></div>
+          </div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-icon green"><i class="fa-solid fa-person-digging"></i></div>
+          <div class="metric-info">
+            <h4>Active Shifts Now</h4>
+            <div class="val"><?= $activeShifts ?></div>
+          </div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-icon amber"><i class="fa-solid fa-calendar-day"></i></div>
+          <div class="metric-info">
+            <h4>Today's Activity</h4>
+            <div class="val"><?= $todayPunches ?></div>
+          </div>
+        </div>
+        <div class="metric-card">
+          <div class="metric-icon purple"><i class="fa-solid fa-users"></i></div>
+          <div class="metric-info">
+            <h4>Supervisors Tracked</h4>
+            <div class="val"><?= count($userWise) ?></div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Admin Settings -->
+      <div style="background: white; border: 1px solid var(--slate-200); border-radius: var(--radius-md); padding: 14px 20px; margin-bottom: 24px; display: flex; align-items: center; justify-content: space-between; gap: 16px; flex-wrap: wrap; box-shadow: var(--shadow-sm);">
+        <div style="display: flex; align-items: center; gap: 12px; color: var(--slate-700);">
+          <i class="fa-solid fa-gear" style="font-size: 20px; color: var(--slate-400);"></i>
+          <div>
+            <strong style="display: block; font-size: 14px; color: var(--slate-900);">Working Time Settings</strong>
+            <span style="font-size: 13px; color: var(--slate-500);">Set the standard daily working hours. Time logged beyond this will be counted as daily overtime.</span>
+          </div>
+        </div>
+        <form method="POST" style="display: flex; align-items: center; gap: 10px; margin: 0;">
+          <input type="hidden" name="action" value="update_working_hours">
+          <input type="number" name="working_hours" value="<?= $standardWorkingHours ?>" min="1" max="24" style="width: 80px; padding: 8px 12px; border: 1px solid var(--slate-300); border-radius: var(--radius-md); text-align: center; font-weight: bold; font-size: 14px;" required>
+          <span style="font-size: 13px; font-weight: bold; color: var(--slate-500);">Hours</span>
+          <button type="submit" class="btn btn-primary" style="padding: 8px 16px; font-size: 13px;">Save</button>
+        </form>
+      </div>
+
+      <!-- Controls: Tabs + Filter by User / Date -->
+      <div class="view-control-bar">
+        <div class="tab-pills">
+          <button class="tab-btn <?= $activeTab === 'user_wise' ? 'active' : '' ?>" onclick="switchTab('user_wise')">
+            <i class="fa-solid fa-users-viewfinder"></i> Users Wise Daily Timesheet
+          </button>
+          <button class="tab-btn <?= $activeTab === 'feed' ? 'active' : '' ?>" onclick="switchTab('feed')">
+            <i class="fa-solid fa-list-ul"></i> All Punches Feed
+          </button>
+        </div>
+
+        <div class="filters-group">
+          <label style="font-size: 13px; font-weight: 600; color: var(--slate-600);">Filter User:</label>
+          <select id="userFilterSelect" class="filter-select" onchange="applyUserFilter()">
+            <option value="">All Registered Users</option>
+            <?php foreach ($allUsers as $u): ?>
+              <option value="<?= htmlspecialchars($u['full_name']) ?>" <?= $selectedUserFilter === $u['full_name'] ? 'selected' : '' ?>>
+                <?= htmlspecialchars($u['full_name']) ?> (<?= htmlspecialchars($u['role']) ?>)
+              </option>
+            <?php endforeach; ?>
+          </select>
+
+          <label style="font-size: 13px; font-weight: 600; color: var(--slate-600); margin-left: 8px;">Date:</label>
+          <input type="date" id="dateFilterInput" class="filter-select" onchange="applyDateFilter()">
+          <button class="btn btn-outline" style="padding: 7px 12px; font-size: 12px;" onclick="clearFilters()" title="Reset Filters">
+            <i class="fa-solid fa-xmark"></i> Clear
+          </button>
+        </div>
+      </div>
+
+      <!-- TAB 1: USER-WISE DAILY TIMESHEET VIEW -->
+      <div id="tab-user_wise" style="<?= $activeTab === 'user_wise' ? 'display:block;' : 'display:none;' ?>">
+        <?php if (empty($userWise)): ?>
+          <div class="user-section-card" style="padding: 48px; text-align: center; color: var(--slate-500);">
+            <i class="fa-solid fa-clock-rotate-left" style="font-size: 40px; color: var(--slate-300); margin-bottom: 12px; display: block;"></i>
+            <h3>No Attendance Records Found</h3>
+            <p style="font-size: 13px; margin-top: 4px;">Once supervisors punch in via the mobile app, their full all-day timesheets will appear here grouped user-wise.</p>
+          </div>
+        <?php else: ?>
+          <?php foreach ($userWise as $uName => $uData): ?>
+            <?php
+              // If user filter applied, skip others
+              if (!empty($selectedUserFilter) && strcasecmp($selectedUserFilter, $uName) !== 0) {
+                  continue;
+              }
+
+              $totalHours = floor($uData['total_seconds'] / 3600);
+              $totalMins = floor(($uData['total_seconds'] % 3600) / 60);
+              $totalSecs = $uData['total_seconds'] % 60;
+              $totalTimeStr = sprintf('%02d:%02d:%02d', $totalHours, $totalMins, $totalSecs);
+
+              $userTotalOtSeconds = 0;
+              foreach ($uData['days'] as $day) {
+                  if ($day['day_seconds'] > $standardWorkingSeconds) {
+                      $userTotalOtSeconds += ($day['day_seconds'] - $standardWorkingSeconds);
+                  }
+              }
+              $uOtH = floor($userTotalOtSeconds / 3600);
+              $uOtM = floor(($userTotalOtSeconds % 3600) / 60);
+              $uOtS = $userTotalOtSeconds % 60;
+              $userTotalOtStr = sprintf('%02d:%02d:%02d', $uOtH, $uOtM, $uOtS);
+            ?>
+            <div class="user-section-card user-block" data-user-name="<?= strtolower(htmlspecialchars($uName)) ?>">
+              <!-- User Header -->
+              <div class="user-header">
+                <div class="user-identity">
+                  <div class="user-badge-avatar"><?= htmlspecialchars($uData['initials']) ?></div>
+                  <div class="user-meta">
+                    <h3><?= htmlspecialchars($uName) ?></h3>
+                    <div class="sub">
+                      <span><i class="fa-solid fa-id-badge"></i> <?= htmlspecialchars($uData['employee_id']) ?></span>
+                      <span>•</span>
+                      <span><i class="fa-solid fa-calendar-check"></i> <?= count($uData['days']) ?> Days Worked</span>
+                    </div>
+                  </div>
+                </div>
+
+                <div class="user-stats-pill">
+                  <div class="stat-mini">Total Shifts: <strong><?= $uData['total_shifts'] ?></strong></div>
+                  <div class="stat-mini">
+                    Total Time: <strong><?= $totalTimeStr ?></strong>
+                    <?php if ($userTotalOtSeconds > 0): ?>
+                      <span class="badge" style="background: #8b5cf6; color: white; font-size: 10px; margin-left: 5px; padding: 2px 6px;">
+                        <i class="fa-solid fa-arrow-trend-up"></i> OT: <?= $userTotalOtStr ?>
+                      </span>
+                    <?php endif; ?>
+                  </div>
+                </div>
+              </div>
+
+              <!-- Day by Day Listing -->
+              <div class="user-days-container">
+                <?php foreach ($uData['days'] as $dKey => $day): ?>
+                  <?php
+                    $dHrs = floor($day['day_seconds'] / 3600);
+                    $dMins = floor(($day['day_seconds'] % 3600) / 60);
+                    $dayTimeFormatted = ($dHrs > 0 ? "{$dHrs}h " : "") . "{$dMins}m";
+                    $pInFirst = strtotime($day['first_in']);
+                    $pOutLast = !empty($day['last_out']) ? strtotime($day['last_out']) : null;
+                  ?>
+                  <div class="day-card open day-item" data-date="<?= $dKey ?>">
+                    <!-- Day Bar (Clickable Accordion) -->
+                    <div class="day-header" onclick="toggleDay(this)">
+                      <div class="day-title-wrap">
+                        <div class="day-calendar-box">
+                          <span class="cal-month"><?= date('M', $pInFirst) ?></span>
+                          <span class="cal-num"><?= date('d', $pInFirst) ?></span>
+                        </div>
+                        <div class="day-info">
+                          <h4><?= $day['day_name'] ?>, <?= $day['formatted_date'] ?></h4>
+                          <span>
+                            First In: <strong><?= date('h:i A', $pInFirst) ?></strong>
+                            <?php if ($pOutLast): ?>
+                              • Last Out: <strong><?= date('h:i A', $pOutLast) ?></strong>
+                            <?php endif; ?>
+                            • <?= count($day['punches']) ?> Site Visit<?= count($day['punches']) > 1 ? 's' : '' ?>
+                          </span>
+                        </div>
+                      </div>
+
+                      <div class="day-summary-badges">
+                        <!-- Sites Visited Tags -->
+                        <?php foreach ($day['sites'] as $sName): ?>
+                          <span class="badge badge-neutral"><i class="fa-solid fa-city"></i> <?= htmlspecialchars($sName) ?></span>
+                        <?php endforeach; ?>
+
+                        <!-- Day Working Hours -->
+                        <span class="badge badge-primary">
+                          <i class="fa-regular fa-clock"></i> <?= $dayTimeFormatted ?>
+                        </span>
+
+                        <!-- Daily Overtime -->
+                        <?php if ($day['day_seconds'] > $standardWorkingSeconds): ?>
+                          <?php
+                            $otSecs = $day['day_seconds'] - $standardWorkingSeconds;
+                            $otH = floor($otSecs / 3600);
+                            $otM = floor(($otSecs % 3600) / 60);
+                            $otS = $otSecs % 60;
+                            $otFormatted = sprintf('%02d:%02d:%02d', $otH, $otM, $otS);
+                          ?>
+                          <span class="badge" style="background: #8b5cf6; color: white;">
+                            <i class="fa-solid fa-arrow-trend-up"></i> OT: <?= $otFormatted ?>
+                          </span>
+                        <?php endif; ?>
+
+                        <!-- Status Badge -->
+                        <?php if ($day['has_active']): ?>
+                          <span class="badge badge-warning">
+                            <i class="fa-solid fa-spinner fa-spin"></i> Active Shift
+                          </span>
+                        <?php else: ?>
+                          <span class="badge badge-success">
+                            <i class="fa-solid fa-check"></i> Completed
+                          </span>
+                        <?php endif; ?>
+
+                        <i class="fa-solid fa-chevron-down toggle-icon"></i>
+                      </div>
+                    </div>
+
+                    <!-- Day Expanded Punch Details Table -->
+                    <div class="day-content">
+                      <table class="punches-table">
+                        <thead>
+                          <tr>
+                            <th>Construction Site</th>
+                            <th>Punch In Time</th>
+                            <th>Punch Out Time</th>
+                            <th>Duration</th>
+                            <th style="text-align: right; width: 100px;">Details</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          <?php foreach ($day['punches'] as $idx => $p): ?>
+                            <?php
+                              $pIn = strtotime($p['punch_in_time']);
+                              $pOut = !empty($p['punch_out_time']) ? strtotime($p['punch_out_time']) : null;
+                              $pLat = (float)($p['punch_in_latitude'] ?? 0);
+                              $pLng = (float)($p['punch_in_longitude'] ?? 0);
+                              $mapLink = "https://www.google.com/maps?q={$pLat},{$pLng}";
+
+                              $pDuration = 'Live';
+                              if ($pOut) {
+                                  $diff = $pOut - $pIn;
+                                  $h = floor($diff / 3600);
+                                  $m = floor(($diff % 3600) / 60);
+                                  $s = $diff % 60;
+                                  $pDuration = sprintf('%02d:%02d:%02d', $h, $m, $s);
+                              } else {
+                                  $diff = time() - $pIn;
+                                  $h = floor($diff / 3600);
+                                  $m = floor(($diff % 3600) / 60);
+                                  $s = $diff % 60;
+                                  $pDuration = sprintf('%02d:%02d:%02d', $h, $m, $s) . " (active)";
+                              }
+                            ?>
+                            <tr>
+                              <td>
+                                <strong><?= htmlspecialchars($p['site_name']) ?></strong>
+                              </td>
+                              <td>
+                                <strong style="color: var(--slate-900);"><?= date('h:i:s A', $pIn) ?></strong>
+                              </td>
+                              <td>
+                                <?php if ($pOut): ?>
+                                  <strong style="color: var(--slate-800);"><?= date('h:i:s A', $pOut) ?></strong>
+                                <?php else: ?>
+                                  <span class="badge badge-warning" style="font-size: 11px;">
+                                    <i class="fa-solid fa-spinner fa-spin"></i> In Progress
+                                  </span>
+                                <?php endif; ?>
+                              </td>
+                              <td>
+                                <strong style="color: <?= $pOut ? 'var(--slate-700)' : 'var(--success)' ?>;"><?= $pDuration ?></strong>
+                              </td>
+                              <td style="text-align: right; white-space: nowrap;">
+                                <button type="button" class="btn btn-outline" style="padding: 5px 8px; font-size: 12px; color: var(--primary);" 
+                                        onclick="document.getElementById('details-<?= (int)$p['id'] ?>').style.display = document.getElementById('details-<?= (int)$p['id'] ?>').style.display === 'none' ? 'table-row' : 'none'" 
+                                        title="View More Details">
+                                  View More <i class="fa-solid fa-chevron-down" style="margin-left: 4px; font-size: 10px;"></i>
+                                </button>
+                              </td>
+                            </tr>
+                            <tr id="details-<?= (int)$p['id'] ?>" style="display: none; background: #f8fafc;">
+                              <td colspan="5" style="padding: 16px; border-bottom: 2px solid var(--slate-200);">
+                                <div style="display: flex; gap: 24px; flex-wrap: wrap;">
+                                  <div>
+                                    <strong style="font-size: 11px; text-transform: uppercase; color: var(--slate-500); display: block; margin-bottom: 6px;">Status / Verification</strong>
+                                    <span class="badge <?= !empty($p['is_within_geofence']) ? 'badge-success' : 'badge-danger' ?>">
+                                      <?= !empty($p['is_within_geofence']) ? 'Verified' : 'Outside' ?>
+                                    </span>
+                                  </div>
+                                  <div>
+                                    <strong style="font-size: 11px; text-transform: uppercase; color: var(--slate-500); display: block; margin-bottom: 6px;">Location / GPS</strong>
+                                    <?php if ($pLat != 0 && $pLng != 0): ?>
+                                      <a href="<?= $mapLink ?>" target="_blank" class="coords-link" title="Open GPS Coordinates in Google Maps">
+                                        <i class="fa-solid fa-location-dot" style="color: #EF4444;"></i>
+                                        <?= number_format($pLat, 4) ?>, <?= number_format($pLng, 4) ?>
+                                      </a>
+                                      <br><small style="color: var(--slate-500);"><?= (int)$p['distance_meters'] ?>m from geofence</small>
+                                    <?php else: ?>
+                                      <span style="color: var(--slate-400);">GPS Standby</span>
+                                    <?php endif; ?>
+                                  </div>
+                                  <div>
+                                    <strong style="font-size: 11px; text-transform: uppercase; color: var(--slate-500); display: block; margin-bottom: 6px;">Photos</strong>
+                                    <div class="photo-thumb-wrap">
+                                      <?php if (!empty($p['photo_url'])): ?>
+                                        <div class="photo-item" title="Click to view Punch In Photo">
+                                          <img src="<?= htmlspecialchars($p['photo_url']) ?>" class="photo-thumb" onclick="previewPhoto('<?= htmlspecialchars($p['photo_url']) ?>', 'Punch In Photo • <?= htmlspecialchars($uName) ?> (<?= htmlspecialchars($p['site_name']) ?>)')" alt="In Photo">
+                                          <span class="photo-tag">IN</span>
+                                        </div>
+                                      <?php endif; ?>
+                                      <?php if (!empty($p['punch_out_photo_url'])): ?>
+                                        <div class="photo-item" title="Click to view Punch Out Photo">
+                                          <img src="<?= htmlspecialchars($p['punch_out_photo_url']) ?>" class="photo-thumb" onclick="previewPhoto('<?= htmlspecialchars($p['punch_out_photo_url']) ?>', 'Punch Out Photo • <?= htmlspecialchars($uName) ?> (<?= htmlspecialchars($p['site_name']) ?>)')" alt="Out Photo">
+                                          <span class="photo-tag" style="background:#0066FF;">OUT</span>
+                                        </div>
+                                      <?php endif; ?>
+                                      <?php if (empty($p['photo_url']) && empty($p['punch_out_photo_url'])): ?>
+                                        <span style="color: var(--slate-400); font-size: 11px;">No photo</span>
+                                      <?php endif; ?>
+                                    </div>
+                                  </div>
+                                  <div style="flex: 1; min-width: 200px;">
+                                    <strong style="font-size: 11px; text-transform: uppercase; color: var(--slate-500); display: block; margin-bottom: 6px;">Notes</strong>
+                                    <div style="font-size: 12px; color: var(--slate-700); white-space: pre-line;">
+                                      <?= !empty($p['notes']) ? htmlspecialchars($p['notes']) : '<span style="color:var(--slate-400);">- No notes provided -</span>' ?>
+                                    </div>
+                                  </div>
+                                  <div style="text-align: right;">
+                                    <strong style="font-size: 11px; text-transform: uppercase; color: var(--slate-500); display: block; margin-bottom: 6px;">Action</strong>
+                                    <button type="button" class="btn btn-outline" style="padding: 5px 12px; font-size: 12px; color: #EF4444; border-color: rgba(239, 68, 68, 0.25);" 
+                                            onclick="promptDeleteAttendance(<?= (int)$p['id'] ?>, '<?= htmlspecialchars(addslashes($uName)) ?>', '<?= htmlspecialchars(addslashes($p['site_name'])) ?>', '<?= date('M d, h:i A', $pIn) ?>')" 
+                                            title="Delete Attendance Record">
+                                      <i class="fa-solid fa-trash-can"></i> Delete
+                                    </button>
+                                  </div>
+                                </div>
+                              </td>
+                            </tr>
+                          <?php endforeach; ?>
+                        </tbody>
+                        <tfoot>
+                          <tr>
+                            <td colspan="5" style="background: #f8fafc; padding: 14px 20px; border-top: 2px solid var(--slate-200);">
+                               <div style="display: flex; gap: 40px; font-size: 13px; align-items: center; justify-content: flex-end;">
+                                 <div>
+                                   <span style="color: var(--slate-500); text-transform: uppercase; font-size: 11px; font-weight: 700; display: block; margin-bottom: 2px;">Standard Hours</span>
+                                   <strong style="color: var(--slate-700); font-size: 14px;"><?= $standardWorkingHours ?>h 00m</strong>
+                                 </div>
+                                 <div>
+                                   <span style="color: var(--slate-500); text-transform: uppercase; font-size: 11px; font-weight: 700; display: block; margin-bottom: 2px;">Total Logged Time</span>
+                                   <strong style="color: var(--slate-900); font-size: 14px;"><?= $dayTimeFormatted ?></strong>
+                                 </div>
+                                 <div>
+                                   <span style="color: var(--slate-500); text-transform: uppercase; font-size: 11px; font-weight: 700; display: block; margin-bottom: 2px;">Overtime Earned</span>
+                                   <?php if ($day['day_seconds'] > $standardWorkingSeconds): ?>
+                                     <?php
+                                        $fOtSecs = $day['day_seconds'] - $standardWorkingSeconds;
+                                        $fOtFormatted = sprintf('%02d:%02d:%02d', floor($fOtSecs / 3600), floor(($fOtSecs % 3600) / 60), $fOtSecs % 60);
+                                     ?>
+                                     <strong style="color: #8b5cf6; font-size: 14px;"><?= $fOtFormatted ?></strong>
+                                   <?php else: ?>
+                                     <strong style="color: var(--slate-400); font-size: 14px;">00:00:00</strong>
+                                   <?php endif; ?>
+                                 </div>
+                               </div>
+                            </td>
+                          </tr>
+                        </tfoot>
+                      </table>
+                    </div>
+                  </div>
+                <?php endforeach; ?>
+              </div>
+            </div>
+          <?php endforeach; ?>
+        <?php endif; ?>
+      </div>
+
+      <!-- TAB 2: ALL PUNCHES FEED -->
+      <div id="tab-feed" style="<?= $activeTab === 'feed' ? 'display:block;' : 'display:none;' ?>">
+        <div class="user-section-card">
+          <div class="user-header">
+            <h3>Chronological Activity Stream</h3>
+            <span style="font-size: 13px; color: var(--slate-500);"><i class="fa-solid fa-bolt" style="color: var(--primary);"></i> All field punches in chronological order</span>
+          </div>
+
+          <table style="width: 100%; border-collapse: collapse; font-size: 13px;">
+            <thead>
+              <tr style="background: var(--slate-50); border-bottom: 1px solid var(--slate-200);">
+                <th style="padding: 12px 18px; text-align: left;">Date</th>
+                <th style="padding: 12px 18px; text-align: left;">Supervisor</th>
+                <th style="padding: 12px 18px; text-align: left;">Site Visited</th>
+                <th style="padding: 12px 18px; text-align: left;">Punch In</th>
+                <th style="padding: 12px 18px; text-align: left;">GPS Location</th>
+                <th style="padding: 12px 18px; text-align: left;">Photos</th>
+                <th style="padding: 12px 18px; text-align: left;">Punch Out</th>
+                <th style="padding: 12px 18px; text-align: left;">Duration</th>
+                <th style="padding: 12px 18px; text-align: left;">Verification</th>
+                <th style="padding: 12px 18px; text-align: right; width: 70px;">Action</th>
+              </tr>
+            </thead>
+            <tbody>
+              <?php if (empty($logs)): ?>
+                <tr><td colspan="10" style="text-align: center; padding: 24px; color: var(--slate-500);">No attendance records found.</td></tr>
+              <?php else: ?>
+                <?php foreach ($logs as $l): ?>
+                  <?php
+                    $pIn = strtotime($l['punch_in_time']);
+                    $pOut = !empty($l['punch_out_time']) ? strtotime($l['punch_out_time']) : null;
+                    $lat = (float)($l['punch_in_latitude'] ?? 0);
+                    $lng = (float)($l['punch_in_longitude'] ?? 0);
+                    $mUrl = "https://www.google.com/maps?q={$lat},{$lng}";
+
+                    $dur = 'Live Shift';
+                    if ($pOut) {
+                        $diff = $pOut - $pIn;
+                        $h = floor($diff / 3600);
+                        $m = floor(($diff % 3600) / 60);
+                        $s = $diff % 60;
+                        $dur = sprintf('%02d:%02d:%02d', $h, $m, $s);
+                    }
+                  ?>
+                  <tr style="border-bottom: 1px solid var(--slate-200);">
+                    <td style="padding: 14px 18px;">
+                      <strong><?= date('M d, Y', $pIn) ?></strong><br>
+                      <small style="color: var(--slate-500);"><?= date('h:i A', $pIn) ?></small>
+                    </td>
+                    <td style="padding: 14px 18px;">
+                      <strong><?= htmlspecialchars($l['supervisor_name']) ?></strong><br>
+                      <small style="color: var(--slate-500); font-family: monospace;"><?= htmlspecialchars($l['employee_id']) ?></small>
+                    </td>
+                    <td style="padding: 14px 18px;">
+                      <strong><?= htmlspecialchars($l['site_name']) ?></strong>
+                    </td>
+                    <td style="padding: 14px 18px;">
+                      <strong><?= date('h:i A', $pIn) ?></strong>
+                    </td>
+                    <td style="padding: 14px 18px;">
+                      <?php if ($lat != 0 && $lng != 0): ?>
+                        <a href="<?= $mUrl ?>" target="_blank" class="coords-link">
+                          <i class="fa-solid fa-location-dot" style="color: #EF4444;"></i>
+                          <?= number_format($lat, 4) ?>, <?= number_format($lng, 4) ?>
+                        </a>
+                        <br><small style="color: var(--slate-500);"><?= (int)$l['distance_meters'] ?>m</small>
+                      <?php else: ?>
+                        <span style="color: var(--slate-400);">GPS Standby</span>
+                      <?php endif; ?>
+                    </td>
+                    <td style="padding: 14px 18px;">
+                      <div class="photo-thumb-wrap">
+                        <?php if (!empty($l['photo_url'])): ?>
+                          <div class="photo-item">
+                            <img src="<?= htmlspecialchars($l['photo_url']) ?>" class="photo-thumb" onclick="previewPhoto('<?= htmlspecialchars($l['photo_url']) ?>', 'Punch In Photo • <?= htmlspecialchars($l['supervisor_name']) ?>')" alt="Punch Photo">
+                            <span class="photo-tag">IN</span>
+                          </div>
+                        <?php endif; ?>
+                        <?php if (!empty($l['punch_out_photo_url'])): ?>
+                          <div class="photo-item">
+                            <img src="<?= htmlspecialchars($l['punch_out_photo_url']) ?>" class="photo-thumb" onclick="previewPhoto('<?= htmlspecialchars($l['punch_out_photo_url']) ?>', 'Punch Out Photo • <?= htmlspecialchars($l['supervisor_name']) ?>')" alt="Out Photo">
+                            <span class="photo-tag" style="background:#0066FF;">OUT</span>
+                          </div>
+                        <?php endif; ?>
+                      </div>
+                    </td>
+                    <td style="padding: 14px 18px;">
+                      <?= $pOut ? date('h:i A', $pOut) : '<span class="badge badge-warning">Active Shift</span>' ?>
+                    </td>
+                    <td style="padding: 14px 18px;">
+                      <strong><?= $dur ?></strong>
+                    </td>
+                    <td style="padding: 14px 18px;">
+                      <span class="badge <?= !empty($l['is_within_geofence']) ? 'badge-success' : 'badge-danger' ?>">
+                        <?= !empty($l['is_within_geofence']) ? 'Verified' : 'Outside' ?>
+                      </span>
+                    </td>
+                    <td style="padding: 14px 18px; text-align: right; white-space: nowrap;">
+                      <button type="button" class="btn btn-outline" style="padding: 5px 8px; font-size: 12px; color: #EF4444; border-color: rgba(239, 68, 68, 0.25);" 
+                              onclick="promptDeleteAttendance(<?= (int)$l['id'] ?>, '<?= htmlspecialchars(addslashes($l['supervisor_name'])) ?>', '<?= htmlspecialchars(addslashes($l['site_name'])) ?>', '<?= date('M d, h:i A', $pIn) ?>')" 
+                              title="Delete Attendance Record">
+                        <i class="fa-solid fa-trash-can"></i>
+                      </button>
+                    </td>
+                  </tr>
+                <?php endforeach; ?>
+              <?php endif; ?>
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+    </div>
+  </main>
+
+  <!-- Photo Preview Modal -->
+  <div class="modal-overlay" id="photoModal" onclick="closePhotoModal()">
+    <div class="photo-modal-card" onclick="event.stopPropagation()">
+      <div class="photo-modal-title" id="previewTitle">Site Verification Photo</div>
+      <img id="previewImg" src="" alt="Verification Photo">
+      <div style="margin-top: 16px; display: flex; justify-content: flex-end; gap: 8px;">
+        <button class="btn btn-outline" onclick="closePhotoModal()">Close</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- Delete Attendance Confirmation Modal -->
+  <div class="modal-overlay" id="deleteAttendanceModal" onclick="closeModal('deleteAttendanceModal')">
+    <div class="photo-modal-card" style="max-width: 440px; text-align: left;" onclick="event.stopPropagation()">
+      <div style="display: flex; align-items: flex-start; gap: 14px; margin-bottom: 16px;">
+        <div style="width: 44px; height: 44px; border-radius: 12px; background: rgba(239, 68, 68, 0.12); display: flex; align-items: center; justify-content: center; color: #EF4444; font-size: 20px; flex-shrink: 0;">
+          <i class="fa-solid fa-trash-can"></i>
+        </div>
+        <div>
+          <h3 style="font-size: 16px; font-weight: 700; color: var(--slate-900); margin-bottom: 4px;">Delete Attendance Record</h3>
+          <p style="font-size: 13px; color: var(--slate-500); line-height: 1.4;">
+            Permanently remove this attendance punch from the database? This action cannot be undone.
+          </p>
+        </div>
+      </div>
+
+      <div style="background: var(--slate-50); border: 1px solid var(--slate-200); border-radius: var(--radius-md); padding: 12px 14px; margin-bottom: 20px; font-size: 13px;">
+        <div style="display: flex; justify-content: space-between; margin-bottom: 6px;">
+          <span style="color: var(--slate-500);">Supervisor:</span>
+          <strong style="color: var(--slate-900);" id="deleteTargetSupervisor">-</strong>
+        </div>
+        <div style="display: flex; justify-content: space-between; margin-bottom: 6px;">
+          <span style="color: var(--slate-500);">Site:</span>
+          <strong style="color: var(--slate-900);" id="deleteTargetSite">-</strong>
+        </div>
+        <div style="display: flex; justify-content: space-between;">
+          <span style="color: var(--slate-500);">Punch In:</span>
+          <strong style="color: var(--slate-900);" id="deleteTargetTime">-</strong>
+        </div>
+      </div>
+
+      <input type="hidden" id="pendingDeleteAttendanceId" value="">
+
+      <div style="display: flex; justify-content: flex-end; gap: 10px;">
+        <button type="button" class="btn btn-outline" onclick="closeModal('deleteAttendanceModal')">Cancel</button>
+        <button type="button" class="btn btn-primary" id="confirmDeleteAttendanceBtn" style="background: #EF4444; border-color: #DC2626;" onclick="executeDeleteAttendance()">
+          <i class="fa-solid fa-trash-can"></i> Yes, Delete Record
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    function openModal(id) {
+      const el = document.getElementById(id);
+      if (el) el.classList.add('open');
+    }
+
+    function closeModal(id) {
+      const el = document.getElementById(id);
+      if (el) el.classList.remove('open');
+    }
+
+    function promptDeleteAttendance(id, supervisor, site, time) {
+      document.getElementById('pendingDeleteAttendanceId').value = id;
+      document.getElementById('deleteTargetSupervisor').textContent = supervisor || 'Supervisor';
+      document.getElementById('deleteTargetSite').textContent = site || 'Site';
+      document.getElementById('deleteTargetTime').textContent = time || '-';
+      const btn = document.getElementById('confirmDeleteAttendanceBtn');
+      if (btn) {
+        btn.innerHTML = '<i class="fa-solid fa-trash-can"></i> Yes, Delete Record';
+        btn.disabled = false;
+      }
+      openModal('deleteAttendanceModal');
+    }
+
+    async function executeDeleteAttendance() {
+      const id = document.getElementById('pendingDeleteAttendanceId').value;
+      if (!id) return;
+
+      const btn = document.getElementById('confirmDeleteAttendanceBtn');
+      if (btn) {
+        btn.innerHTML = '<i class="fa-solid fa-circle-notch fa-spin"></i> Deleting...';
+        btn.disabled = true;
+      }
+
+      try {
+        const res = await fetch('../backend/attendance/delete.php', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ id: id })
+        });
+        const result = await res.json();
+        if (result.success) {
+          closeModal('deleteAttendanceModal');
+          showNotification(result.message || 'Record deleted successfully.', 'success');
+          setTimeout(() => window.location.reload(), 600);
+        } else {
+          alert(result.message || 'Failed to delete attendance record.');
+          if (btn) {
+            btn.innerHTML = '<i class="fa-solid fa-trash-can"></i> Yes, Delete Record';
+            btn.disabled = false;
+          }
+        }
+      } catch (e) {
+        // Fallback to direct form submit
+        const f = document.createElement('form');
+        f.method = 'POST';
+        f.action = 'attendance.php';
+        f.innerHTML = `<input type="hidden" name="action" value="delete_attendance"><input type="hidden" name="id" value="${id}">`;
+        document.body.appendChild(f);
+        f.submit();
+      }
+    }
+
+    async function triggerCleanDuplicates() {
+      if (!confirm("Are you sure you want to clean and purge duplicate attendance entries?\n\nThis will remove rapid duplicate punches (within 120s at the same site) and synchronize orphaned active shifts.")) {
+        return;
+      }
+      try {
+        const res = await fetch('../backend/attendance/delete.php?action=clean_duplicates', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ action: 'clean_duplicates' })
+        });
+        const result = await res.json();
+        if (result.success) {
+          showNotification(result.message || 'Duplicate records cleaned successfully.', 'success');
+          setTimeout(() => window.location.reload(), 700);
+        } else {
+          alert(result.message || 'Failed to clean duplicates.');
+        }
+      } catch (e) {
+        // Form post fallback
+        const f = document.createElement('form');
+        f.method = 'POST';
+        f.action = 'attendance.php';
+        f.innerHTML = `<input type="hidden" name="action" value="clean_duplicates">`;
+        document.body.appendChild(f);
+        f.submit();
+      }
+    }
+
+    function showNotification(msg, type = 'success') {
+      let toast = document.createElement('div');
+      toast.style.cssText = `
+        position: fixed; bottom: 24px; right: 24px; z-index: 99999;
+        background: #0F172A; color: white; padding: 14px 20px;
+        border-radius: 12px; border: 1px solid rgba(16, 185, 129, 0.4);
+        box-shadow: 0 10px 25px rgba(0,0,0,0.5); font-size: 14px;
+        display: flex; align-items: center; gap: 12px;
+      `;
+      toast.innerHTML = `<i class="fa-solid fa-circle-check" style="color: #10B981; font-size: 18px;"></i> <span>${msg}</span>`;
+      document.body.appendChild(toast);
+      setTimeout(() => toast.remove(), 3500);
+    }
+
+    function toggleDay(headerEl) {
+      const card = headerEl.closest('.day-card');
+      card.classList.toggle('open');
+    }
+
+    function switchTab(tab) {
+      document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+      document.getElementById('tab-user_wise').style.display = tab === 'user_wise' ? 'block' : 'none';
+      document.getElementById('tab-feed').style.display = tab === 'feed' ? 'block' : 'none';
+      
+      const btns = document.querySelectorAll('.tab-btn');
+      if (tab === 'user_wise' && btns[0]) btns[0].classList.add('active');
+      if (tab === 'feed' && btns[1]) btns[1].classList.add('active');
+    }
+
+    function applyUserFilter() {
+      const selected = document.getElementById('userFilterSelect').value.toLowerCase().trim();
+      const userBlocks = document.querySelectorAll('.user-block');
+      userBlocks.forEach(b => {
+        const uName = b.getAttribute('data-user-name') || '';
+        if (!selected || uName === selected || uName.includes(selected)) {
+          b.style.display = 'block';
+        } else {
+          b.style.display = 'none';
+        }
+      });
+    }
+
+    function applyDateFilter() {
+      const selectedDate = document.getElementById('dateFilterInput').value;
+      if (!selectedDate) {
+        document.querySelectorAll('.day-item').forEach(d => d.style.display = 'block');
+        return;
+      }
+      document.querySelectorAll('.day-item').forEach(d => {
+        const dDate = d.getAttribute('data-date');
+        d.style.display = (dDate === selectedDate) ? 'block' : 'none';
+      });
+    }
+
+    function clearFilters() {
+      document.getElementById('userFilterSelect').value = '';
+      document.getElementById('dateFilterInput').value = '';
+      document.querySelectorAll('.user-block').forEach(b => b.style.display = 'block');
+      document.querySelectorAll('.day-item').forEach(d => d.style.display = 'block');
+    }
+
+    function previewPhoto(url, title) {
+      document.getElementById('previewTitle').innerText = title || 'Site Verification Photo';
+      document.getElementById('previewImg').src = url;
+      document.getElementById('photoModal').classList.add('open');
+    }
+
+    function closePhotoModal() {
+      document.getElementById('photoModal').classList.remove('open');
+    }
+
+    function exportCSV() {
+      window.location.href = '../backend/attendance/list.php';
+    }
+
+    // Auto-apply initial filter if URL parameter exists
+    window.addEventListener('DOMContentLoaded', () => {
+      const urlParams = new URLSearchParams(window.location.search);
+      const userParam = urlParams.get('user');
+      if (userParam) {
+        document.getElementById('userFilterSelect').value = userParam;
+        applyUserFilter();
+      }
+    });
+  </script>
+</body>
+</html>

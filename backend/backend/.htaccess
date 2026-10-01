@@ -1,0 +1,33 @@
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /sitetracker/backend/
+
+    # Pass Authorization Header to PHP in Apache
+    SetEnvIf Authorization "(.*)" HTTP_AUTHORIZATION=$1
+    RewriteCond %{HTTP:Authorization} ^(.*)
+    RewriteRule .* - [e=HTTP_AUTHORIZATION:%1]
+
+    # Map /sites -> /sites/list.php
+    RewriteRule ^sites/?$ sites/list.php [L,QSA]
+    RewriteRule ^sites/([0-9]+)/?$ sites/list.php?id=$1 [L,QSA]
+
+    # Map /auth/login -> /auth/login.php
+    RewriteRule ^auth/login/?$ auth/login.php [L,QSA]
+    RewriteRule ^auth/me/?$ auth/login.php [L,QSA]
+
+    # Map /attendance/active -> /attendance/active.php
+    RewriteRule ^attendance/active/?$ attendance/active.php [L,QSA]
+    RewriteRule ^attendance/punch-in/?$ attendance/punch-in.php [L,QSA]
+    RewriteRule ^attendance/punch-out/?$ attendance/punch-out.php [L,QSA]
+    RewriteRule ^attendance/history/?$ attendance/list.php [L,QSA]
+    RewriteRule ^attendance/?$ attendance/list.php [L,QSA]
+
+    # If requested file or directory exists, serve it
+    RewriteCond %{REQUEST_FILENAME} -f [OR]
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteRule ^ - [L]
+
+    # Generic rule: append .php if file exists
+    RewriteCond %{REQUEST_FILENAME}.php -f
+    RewriteRule ^(.*)$ $1.php [L,QSA]
+</IfModule>
